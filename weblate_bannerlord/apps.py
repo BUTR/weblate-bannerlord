@@ -61,6 +61,9 @@ class BannerlordConfig(AppConfig):
     name = "weblate_bannerlord"
 
     def ready(self) -> None:
+        # register the translation-finder backend for the component wizard
+        from weblate_bannerlord import discovery  # noqa: F401
+
         from weblate.trans.models import Component
 
         orig = Component.get_language_alias
@@ -70,7 +73,7 @@ class BannerlordConfig(AppConfig):
             if result != code:
                 # per-project "Language aliases" field or source mapping won
                 return result
-            if self.file_format != "bannerlord-xml":
+            if self.file_format not in {"bannerlord-xml", "bannerlord-manifest"}:
                 return code
             return resolve_from_manifest(self, code) or code
 

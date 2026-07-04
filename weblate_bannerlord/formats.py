@@ -16,6 +16,7 @@ in docker-compose.yml. The <tags> section and any other siblings of <strings>
 are preserved untouched on write.
 """
 
+import os
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -169,3 +170,171 @@ class BannerlordXMLFormat(TTKitFormat):
                 "</LanguageData>\n",
                 encoding="utf-8",
             )
+
+
+class BannerlordLanguageStore(base.TranslationStore):
+    """Multi-file store driven by a language_data.xml manifest.
+
+    The store's file is the manifest; all <LanguageFile xml_path="..."/>
+    entries (paths relative to the Languages/ root) are loaded as
+    BannerlordXMLFile sub-stores and their units exposed as one store.
+    String ids are globally unique per language in Bannerlord, so units are
+    keyed by id alone; new units are appended to the first listed file (the
+    game merges all files, placement is cosmetic).
+    """
+
+    UnitClass = BannerlordXMLUnit
+    _name = "Bannerlord Language Store"
+    Mimetypes = ["text/xml"]
+    Extensions = ["xml"]
+
+    def __init__(self, inputfile=None, **kwargs) -> None:
+        self.manifest_tree = None
+        self.substores = []  # (absolute path, BannerlordXMLFile)
+        super().__init__(**kwargs)
+        if inputfile is not None:
+            self.parse(inputfile)
+
+    @property
+    def file_paths(self):
+        return [path for path, _sub in self.substores]
+
+    def parse(self, xml) -> None:
+        if not getattr(self, "filename", ""):
+            self.filename = getattr(xml, "name", "")
+        if hasattr(xml, "read"):
+            xml.seek(0)
+            xml = xml.read()
+        self.manifest_tree = parse_xml(xml, strip_cdata=False).getroottree()
+        root = self.manifest_tree.getroot()
+        assert root.tag == "LanguageData", (
+            f"expected root name to be LanguageData but got {root.tag}"
+        )
+        if not self.filename:
+            # in-memory parse (e.g. upload): sibling files are unreachable
+            return
+        lang_dir = os.path.dirname(os.path.abspath(self.filename))
+        languages_root = os.path.dirname(lang_dir)
+        for entry in root.iter("LanguageFile"):
+            xml_path = entry.get("xml_path")
+            if not xml_path:
+                continue
+            path = os.path.join(languages_root, *xml_path.split("/"))
+            if not os.path.isfile(path):
+                continue
+            sub = BannerlordXMLFile.parsefile(path)
+            self.substores.append((path, sub))
+            self.units.extend(sub.units)
+
+    def serialize(self, out) -> None:
+        encoding = self.manifest_tree.docinfo.encoding or "utf-8"
+        out.write(
+            etree.tostring(
+                self.manifest_tree, xml_declaration=True, encoding=encoding
+            )
+        )
+        for path, sub in self.substores:
+            sub.savefile(path)
+
+    def addunit(self, unit, new=True) -> None:
+        if new:
+            if not self.substores:
+                msg = "manifest lists no existing translation files"
+                raise ValueError(msg)
+            self.substores[0][1].addunit(unit)
+        self.units.append(unit)
+
+    def removeunit(self, unit) -> None:
+        if unit in self.units:
+            self.units.remove(unit)
+        for _path, sub in self.substores:
+            if unit in sub.units:
+                sub.removeunit(unit)
+                break
+
+
+class BannerlordManifestFormat(TTKitFormat):
+    """Bannerlord language folder addressed via its language_data.xml.
+
+    File mask: .../ModuleData/Languages/*/language_data.xml
+    Template & new base: the EN manifest. All strings files referenced by the
+    manifest are part of the translation (simple_filename=False makes Weblate
+    commit every file reported by get_filenames).
+    """
+
+    name = "Bannerlord language manifest"
+    format_id = "bannerlord-manifest"
+    loader = BannerlordLanguageStore
+    monolingual = True
+    unit_class = WeblateFlatXMLUnit
+    simple_filename = False
+
+    def parse_store(self, storefile):
+        # the stock implementation passes bare bytes to the store; the
+        # manifest store needs its own path to locate the referenced files
+        store = self.get_store_instance()
+        if isinstance(storefile, str):
+            store.filename = storefile
+            content = Path(storefile).read_bytes()
+        else:
+            store.filename = getattr(storefile, "name", "")
+            content = storefile.read()
+        store.parse(content)
+        return store
+
+    def get_filenames(self):
+        paths = super().get_filenames()
+        paths.extend(self.store.file_paths)
+        return paths
+
+    @classmethod
+    def create_new_file(
+        cls,
+        filename,
+        language,
+        base,
+        callback=None,
+        file_format_params=None,
+    ) -> None:
+        if not base:
+            msg = "Bannerlord manifest format requires a new base file"
+            raise ValueError(msg)
+        lang_name = getattr(language, "name", "") or str(language)
+        new_dir = Path(filename).parent
+        new_dir.mkdir(parents=True, exist_ok=True)
+
+        base_path = Path(os.path.abspath(base))
+        base_root = etree.parse(str(base_path)).getroot()
+        languages_root = base_path.parent.parent
+
+        entries = []
+        for entry in base_root.iter("LanguageFile"):
+            xml_path = entry.get("xml_path")
+            if not xml_path:
+                continue
+            src = languages_root.joinpath(*xml_path.split("/"))
+            if not src.is_file():
+                continue
+            sub = BannerlordXMLFile.parsefile(str(src))
+            for unit in sub.units:
+                unit.target = ""
+            tag = sub.root.find("tags/tag")
+            if tag is not None:
+                tag.set("language", lang_name)
+            dest = new_dir / src.name
+            sub.savefile(str(dest))
+            entries.append(f"{new_dir.name}/{src.name}")
+
+        name = escape(lang_name, {'"': "&quot;"})
+        iso = escape(language.code.replace("_", "-").lower(), {'"': "&quot;"})
+        lines = "".join(
+            f'  <LanguageFile xml_path="{escape(e, {chr(34): "&quot;"})}" />\n'
+            for e in entries
+        )
+        Path(filename).write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            f'<LanguageData id="{name}" supported_iso="{iso}">\n'
+            f"{lines}"
+            "</LanguageData>\n",
+            encoding="utf-8",
+        )
