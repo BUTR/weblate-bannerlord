@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weblate-bannerlord"
+version = "0.1.0"
+description = "Weblate file format and language resolution for Mount & Blade II: Bannerlord module localization XML"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "BUTR" }]
+requires-python = ">=3.11"
+# weblate, translate-toolkit, lxml and django are provided by the Weblate
+# installation this package is loaded into; declaring them would drag a full
+# Weblate into every pip resolve.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/BUTR/weblate-bannerlord"
+
+[tool.setuptools]
+packages = ["weblate_bannerlord"]
