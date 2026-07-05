@@ -17,6 +17,8 @@ are preserved untouched on write.
 """
 
 import os
+import re
+from io import BytesIO
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -28,6 +30,21 @@ from translate.storage.flatxml import FlatXMLFile, FlatXMLUnit
 from weblate.formats.ttkit import FlatXMLUnit as WeblateFlatXMLUnit
 from weblate.formats.ttkit import TTKitFormat
 
+
+_NATURAL_SPLIT = re.compile(r"(\d+)")
+
+
+def _natural_key(value: str):
+    return (
+        [
+            (0, int(part)) if part.isdigit() else (1, part.casefold())
+            for part in _NATURAL_SPLIT.split(value)
+        ],
+        value,
+    )
+
+_XML_DECL_RE = re.compile(rb"^<\?xml[^>]*\?>\s*")
+_HEADER_COMMENT_RE = re.compile(rb"<!--[^\0]*?Weblate[^\0]*?-->\s*")
 
 class BannerlordXMLUnit(FlatXMLUnit):
     """A <string id="..." text="..."/> element; value lives in the text attribute."""
@@ -77,13 +94,50 @@ class BannerlordXMLFile(FlatXMLFile):
         etree.SubElement(self.root, self.namespaced("strings"))
         self.document = self.root.getroottree()
 
+    # id -> rank map derived from the template (EN) unit order; when set it is
+    # the primary sort key so translations mirror the dev-controlled EN order
+    template_order = None
+    # comment placed above the root element of Weblate-written files
+    header_comment = None
+
     def serialize(self, out) -> None:
-        # stable output: keep <string> elements sorted by id (any comments
-        # inside <strings> sort to the top)
+        # stable output: <string> elements follow the template (EN) order when
+        # known; ids absent from the template (and everything when there is no
+        # template) fall back to natural sort (digit runs compare numerically:
+        # str2 < str10; case-insensitive, raw id as deterministic tiebreaker)
         strings = self.root.find(self.namespaced("strings"))
         if strings is not None:
-            strings[:] = sorted(strings, key=lambda e: e.get(self.key_name) or "")
-        super().serialize(out)
+            # never write empty targets: the game renders text="" as a blank
+            # string instead of falling back to English; absent = fallback
+            for e in list(strings):
+                if e.tag is not etree.Comment and not e.get("text"):
+                    strings.remove(e)
+            if len(strings) == 0:
+                # collapse leftover child indentation so an emptied section
+                # serializes as <strings/> instead of a stray blank line
+                strings.text = None
+            order = self.template_order or {}
+            fallback = len(order)
+            strings[:] = sorted(
+                strings,
+                key=lambda e: (
+                    order.get(e.get(self.key_name), fallback),
+                    _natural_key(e.get(self.key_name) or ""),
+                ),
+            )
+        if not self.header_comment:
+            super().serialize(out)
+            return
+        # lxml cannot reliably emit pre-root comments (setting their tail
+        # silently drops them from output), so inject at the byte level after
+        # the XML declaration; strip any previous managed comment first
+        buf = BytesIO()
+        super().serialize(buf)
+        data = _HEADER_COMMENT_RE.sub(b"", buf.getvalue(), count=1)
+        comment = f"<!--{self.header_comment}-->\n".encode()
+        m = _XML_DECL_RE.match(data)
+        pos = m.end() if m else 0
+        out.write(data[:pos] + comment + data[pos:])
 
     def parse(self, xml) -> None:
         if not hasattr(self, "filename"):
@@ -226,7 +280,31 @@ class BannerlordLanguageStore(base.TranslationStore):
             self.substores.append((path, sub))
             self.units.extend(sub.units)
 
+    template_order = None
+    template_file_index = None
+    header_comment = None
+
     def serialize(self, out) -> None:
+        for _path, sub in self.substores:
+            sub.template_order = self.template_order
+            sub.header_comment = self.header_comment
+        # mirror the template's file layout: relocate strings into the file
+        # holding the same id in EN (clamped to the files this language has)
+        if self.template_file_index and len(self.substores) > 1:
+            last = len(self.substores) - 1
+            for cur, (_path, sub) in enumerate(self.substores):
+                for unit in list(sub.units):
+                    want = self.template_file_index.get(unit.source)
+                    if want is None or min(want, last) == cur:
+                        continue
+                    sub.units.remove(unit)
+                    elem = unit.xmlelement
+                    parent = elem.getparent()
+                    if parent is not None:
+                        parent.remove(elem)
+                    target = self.substores[min(want, last)][1]
+                    target.units.append(unit)
+                    target.strings_node.append(elem)
         encoding = self.manifest_tree.docinfo.encoding or "utf-8"
         out.write(
             etree.tostring(
@@ -241,7 +319,13 @@ class BannerlordLanguageStore(base.TranslationStore):
             if not self.substores:
                 msg = "manifest lists no existing translation files"
                 raise ValueError(msg)
-            self.substores[0][1].addunit(unit)
+            idx = 0
+            if self.template_file_index:
+                idx = min(
+                    self.template_file_index.get(unit.source, 0),
+                    len(self.substores) - 1,
+                )
+            self.substores[idx][1].addunit(unit)
         self.units.append(unit)
 
     def removeunit(self, unit) -> None:
@@ -268,6 +352,31 @@ class BannerlordManifestFormat(TTKitFormat):
     monolingual = True
     unit_class = WeblateFlatXMLUnit
     simple_filename = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # translations mirror the dev-controlled EN unit order on save
+        template = self.template_store
+        if template is None and self.is_template:
+            template = self
+        if template is not None:
+            self.store.template_order = {
+                unit.source: idx for idx, unit in enumerate(template.store.units)
+            }
+            file_map = {}
+            for fidx, (_path, sub) in enumerate(
+                getattr(template.store, "substores", [])
+            ):
+                for unit in sub.units:
+                    file_map.setdefault(unit.source, fidx)
+            self.store.template_file_index = file_map
+        if not self.is_template:
+            from weblate.utils.site import get_site_url
+
+            self.store.header_comment = (
+                " This file is managed by Weblate; do not edit it manually - "
+                f"changes would be overwritten. Translate at {get_site_url()} "
+            )
 
     def parse_store(self, storefile):
         # the stock implementation passes bare bytes to the store; the
@@ -316,6 +425,8 @@ class BannerlordManifestFormat(TTKitFormat):
             if not src.is_file():
                 continue
             sub = BannerlordXMLFile.parsefile(str(src))
+            # keep the template's order in the fresh copy
+            sub.template_order = {u.source: i for i, u in enumerate(sub.units)}
             for unit in sub.units:
                 unit.target = ""
             tag = sub.root.find("tags/tag")
